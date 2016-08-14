@@ -1,6 +1,6 @@
 """
 PyCrawler
-A python crawler base on asyncio and mongodb.
+A python crawler base on asyncio, aiohttp and mongodb.
 
 @author Thomas Perrot
 
@@ -22,28 +22,36 @@ from pymongo.errors import BulkWriteError
 
 
 BATCH_SIZE = 5
+N_TASKS = 9
 
-root_url = 'www.cybelangel.com'
+root_urls = ['www.cybelangel.com', 'stackoverflow.com', 'github.com']
 crawled_urls = set()
-url_hub = [root_url, "{}/sitemap.xml".format(root_url), "{}/robots.txt".format(root_url)]
+url_hub = []
+for url in root_urls:
+    url_hub.extend([url, "{}/sitemap.xml".format(url), "{}/robots.txt".format(url)])
 
 db = pymongo.MongoClient().get_database('test')
 coll = db.get_collection('crawls')
 
 
-async def get_body(url: str) -> str:
+async def get_body(session: aiohttp.ClientSession, url: str) -> str:
     """Returns the html from the given url"""
 
     try:
-        with aiohttp.ClientSession() as session, aiohttp.Timeout(5):
+        with aiohttp.Timeout(5):
             async with session.get('http://' + url) as response:
                 return await response.text()
-    except asyncio.TimeoutError as tme:
-        logging.warning('Timeout exception for {}\n{}'.format(url, tme))
+    except asyncio.TimeoutError:
+        logging.warning('Timeout exception for {}'.format(url))
         return None
     except aiohttp.errors.ClientOSError as coe:
         logging.warning('ClientOSError exception for {}\n{}'.format(url, coe))
         return None
+    except UnicodeDecodeError as ude:
+        logging.warning('UnicodeDecodeError exception for {}\n{}'.format(url, ude))
+        return None
+    except ConnectionResetError:
+        logging.warning('ConnectionResetError for {}'.format(url))
 
 
 def get_internal_links(bs_obj: BeautifulSoup, include_url: str) -> Iterable[str]:
@@ -92,22 +100,29 @@ def insert_bulk(bulk: dict):
 
 
 async def handle_task(work_queue):
+    """Get a new url from the Queue, crawls it, store page in Mongodb, extracts external links, adds them to Queue"""
 
     bulk = []
-    while not work_queue.empty():
-        queue_url = await work_queue.get()
-        crawled_urls.add(queue_url)
-        body = await get_body(queue_url)
-        if body:
-            bulk.append({'_id': queue_url, 'source': body})
-            if len(bulk) >= BATCH_SIZE:
-                await asyncio.get_event_loop().run_in_executor(None, insert_bulk, bulk)
-                bulk = []
-            bs_obj = BeautifulSoup(body, 'html.parser')
-            for new_url in get_external_links(bs_obj, queue_url):
-                if new_url not in crawled_urls:
-                    work_queue.put_nowait(new_url)
-                    print(new_url)
+    with aiohttp.ClientSession() as session:
+        while not work_queue.empty():
+            queue_url = await work_queue.get()
+            crawled_urls.add(queue_url)
+            body = await get_body(session, queue_url)
+            if body:
+                bulk.append({'_id': queue_url, 'source': body})
+                if len(bulk) >= BATCH_SIZE:
+                    await asyncio.get_event_loop().run_in_executor(None, insert_bulk, bulk)
+                    bulk = []
+                bs_obj = BeautifulSoup(body, 'html.parser')
+                for new_url in get_external_links(bs_obj, queue_url):
+                    if new_url not in crawled_urls:
+                        work_queue.put_nowait(new_url)
+                        print(new_url)
+
+
+def ask_exit(signame):
+    print("got signal %s: exit" % signame)
+    asyncio.get_event_loop().stop()
 
 
 def main():
@@ -116,7 +131,7 @@ def main():
     [q.put_nowait(url) for url in url_hub]
     loop = asyncio.get_event_loop()
     loop.set_debug(True)
-    tasks = [handle_task(q) for _ in range(3)]
+    tasks = [handle_task(q) for _ in range(N_TASKS)]
     loop.run_until_complete(asyncio.wait(tasks))
     loop.close()
 
